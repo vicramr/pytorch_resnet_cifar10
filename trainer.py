@@ -55,6 +55,12 @@ parser.add_argument('--save-dir', dest='save_dir',
 parser.add_argument('--save-every', dest='save_every',
                     help='Saves checkpoints at every specified number of epochs',
                     type=int, default=10)
+parser.add_argument('--data-dir', dest='data_dir',
+                    help='The directory where cifar-10-batches-py is located',
+                    default='.', type=str)
+parser.add_argument('--valid-size', dest='valid_size',
+                    help='The size of the validation dataset (this will be split from the training dataset)',
+                    default=5000, type=int)
 best_prec1 = 0
 
 
@@ -85,26 +91,15 @@ def main():
 
     cudnn.benchmark = True
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    dataset = datasets.CIFAR10(args.data_dir, train=True, transform=transforms.ToTensor(), download=False)
+    train_dataset, valid_dataset = torch.utils.data.random_split(
+        dataset,
+        [len(dataset) - args.valid_size, args.valid_size],
+        generator=torch.Generator().manual_seed(1)
+    )
 
-    train_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(root='./data', train=True, transform=transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(32, 4),
-            transforms.ToTensor(),
-            normalize,
-        ]), download=True),
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True)
-
-    val_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(root='./data', train=False, transform=transforms.Compose([
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=128, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+    val_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=128, shuffle=False, num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
@@ -162,6 +157,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
     """
         Run one train epoch
     """
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4)
+    ])
+
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -177,7 +177,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         data_time.update(time.time() - end)
 
         target = target.cuda()
-        input_var = input.cuda()
+        input_var = train_transform(input.cuda())
         target_var = target
         if args.half:
             input_var = input_var.half()

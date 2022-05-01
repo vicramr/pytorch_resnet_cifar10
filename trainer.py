@@ -61,12 +61,22 @@ parser.add_argument('--data-dir', dest='data_dir',
 parser.add_argument('--valid-size', dest='valid_size',
                     help='The size of the validation dataset (this will be split from the training dataset)',
                     default=5000, type=int)
+parser.add_argument('--epsilon', dest='epsilon',
+                    help='The maximum allowed perturbation for any element. Float in [0, 255], will be divided by 255.',
+                    default=8.0, type=float)
+parser.add_argument('--alpha', dest='alpha',
+                    help='The step size for the FGSM attack. Float in [0, 255], will be divided by 255.',
+                    default=10.0, type=float)
 best_prec1 = 0
 
+clip_min = 0.0
+clip_max = 1.0
 
 def main():
     global args, best_prec1
     args = parser.parse_args()
+    args.epsilon = args.epsilon / 255.0
+    args.alpha = args.alpha / 255.0
 
 
     # Check the save_dir exists or not
@@ -130,7 +140,7 @@ def main():
 
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
-        train(train_loader, model, criterion, optimizer, epoch)
+        train_adversarial(train_loader, model, criterion, optimizer, epoch, args.epsilon, args.alpha, clip_min, clip_max)
         lr_scheduler.step()
 
         # evaluate on validation set
@@ -181,6 +191,83 @@ def train(train_loader, model, criterion, optimizer, epoch):
         target_var = target
         if args.half:
             input_var = input_var.half()
+
+        # compute output
+        output = model(input_var)
+        loss = criterion(output, target_var)
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        output = output.float()
+        loss = loss.float()
+        # measure accuracy and record loss
+        prec1 = accuracy(output.data, target)[0]
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                      epoch, i, len(train_loader), batch_time=batch_time,
+                      data_time=data_time, loss=losses, top1=top1))
+
+
+def train_adversarial(train_loader, model, criterion, optimizer, epoch, epsilon, alpha, clip_min, clip_max):
+    """
+        Run one train epoch with adversarial training (untargeted FGSM attack, L-infinity norm)
+        TODO: extend attack to other norms and make attack targeted
+    """
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4)
+    ])
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+
+    # switch to train mode
+    model.train()
+
+    end = time.time()
+    for i, (input, target) in enumerate(train_loader):
+
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        target = target.cuda()
+        input_var = train_transform(input.cuda())
+        target_var = target
+        if args.half:
+            input_var = input_var.half()
+
+        # Perform adversarial attack
+        eta = torch.zeros_like(input_var).uniform_(-epsilon, epsilon)
+        adv_x = input_var + eta
+        adv_x = torch.clamp(adv_x, clip_min, clip_max)
+        adv_x = adv_x.clone().detach().to(torch.float).requires_grad_(True) # Get adv_x ready to compute grad
+        adv_loss = criterion(model(adv_x), target_var)
+        # Don't need to flip sign because this is solely for untargeted attacks
+        # NOTE to implement a targeted attack, would need to take the target as input
+        adv_loss.backward()
+        optimal_perturbation = alpha * torch.sign(adv_x.grad.detach())
+        # FGSM adversarial perturbation is adv_x + optimal_perturbation, plus any needed clipping
+        new_eta = (adv_x + optimal_perturbation) - input_var # isolate eta just to clip it to epsilon ball
+        new_eta_clamped = torch.clamp(new_eta, -epsilon, epsilon)
+        new_adv_x = input_var + new_eta_clamped
+        input_var = torch.clamp(new_adv_x, clip_min, clip_max).detach()
+        # End adversarial attack
 
         # compute output
         output = model(input_var)
